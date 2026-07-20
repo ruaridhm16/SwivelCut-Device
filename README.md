@@ -8,7 +8,7 @@ More information can be found on my portfolio - [ruaridhmurdoch.com](https://rua
 ## Tech Stack
 
 Embedded Code
-- C
+- C++ (ESP32)
 
 Visualiser
 - HTML
