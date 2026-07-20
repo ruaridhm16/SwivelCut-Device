@@ -1,0 +1,732 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>SwivelCut Path Visualiser</title>
+<style>
+  @font-face {
+  font-family: 'Plus Jakarta Sans';
+  src: url('misc/fonts/PlusJakartaSans-Variable.woff2') format('woff2');
+  font-weight: 300 800;
+  font-style: normal;
+  font-display: optional;
+  }
+
+  :root {
+    color-scheme: light;
+    --bg: #d7d7d7;
+    --panel: #d7d7d7;
+    --line: #d5d8dd;
+    --text: #111;
+    --muted: #5c5c5c;
+    --accent: #4C47E2;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    background: var(--bg);
+    color: var(--text);
+    font-family: 'Plus Jakarta Sans', sans-serif;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    padding: 24px 16px 48px;
+  }
+  .layout { display: flex; flex-direction: column; align-items: center; gap: 16px; }
+  canvas {
+    touch-action: none;
+    cursor: crosshair;
+    max-width: 96vw;
+    height: auto;
+  }
+  .panel {
+    background: var(--panel);
+    border: 1px solid var(--line);
+    padding: 16px;
+    display: flex;
+    flex-direction: row;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 20px;
+  }
+  button {
+    background: #a0a0a0;
+    color: var(--text);
+    border: 1px solid var(--line);
+    padding: 9px 12px;
+    font-size: 0.9rem;
+    cursor: pointer;
+  }
+  button:hover { border-color: var(--accent); }
+  button:disabled { opacity: 0.4; cursor: default; }
+  button.primary { background: var(--accent); color: #d8d8d8; border-color: var(--accent); font-weight: 600; }
+  .checkbox-row { display: flex; align-items: center; gap: 8px; font-size: 0.9rem; }
+  .checkbox-row input { width: 16px; height: 16px; }
+  .stats { display: flex; font-size: 0.85rem; }
+  .stats div { display: flex; gap: 6px; }
+  .joint-stack { display: flex; flex-direction: column; gap: 4px; font-size: 0.85rem; }
+  .joint-stack div { display: flex; gap: 6px; }
+  .stats span:last-child, .joint-stack span:last-child { color: var(--text); font-variant-numeric: tabular-nums; }
+</style>
+</head>
+<body>
+  <div class="layout">
+    <canvas id="stage" width="1000" height="1000"></canvas>
+
+    <div class="panel">
+      <button id="playBtn" class="primary">Play</button>
+      <button id="clearBtn">Clear path</button>
+      <label class="checkbox-row">
+        <input type="checkbox" id="stabilizeCheckbox">
+        Stabilization
+      </label>
+
+      <div class="stats">
+        <div><span>Blade</span><span id="bladeVal">UP</span></div>
+      </div>
+      <div class="joint-stack">
+        <div><span>Shoulder Joint</span><span id="j1Val">0.0&deg;</span></div>
+        <div><span>Elbow Joint</span><span id="j2Val">180.0&deg;</span></div>
+      </div>
+    </div>
+  </div>
+
+<script>
+const LINK_1_MM = 260;
+const LINK_2_MM = 255;
+const J1_MIN_DEG = -90, J1_MAX_DEG = 90;
+const J2_MIN_DEG = -180, J2_MAX_DEG = 180;
+const HOME_J1_DEG = 0, HOME_J2_DEG = 180;
+
+const PLAYBACK_SPEED_DEG_PER_SEC = 180;
+
+const PRODUCT_SMOOTHING_MS = 150;
+const PRODUCT_MAX_DEVIATION_DEG = 1.0;
+
+const rad = degrees => degrees * Math.PI / 180;
+const deg = radians => radians * 180 / Math.PI;
+
+function normalizeJointDegrees(degrees) {
+  while (degrees > 180) degrees -= 360;
+  while (degrees < -180) degrees += 360;
+  return degrees;
+}
+
+function shortestJointDelta(targetDeg, currentDeg) {
+  return normalizeJointDegrees(targetDeg - currentDeg);
+}
+
+function angleInRange(j1Deg, j2Deg) {
+  return j1Deg >= J1_MIN_DEG && j1Deg <= J1_MAX_DEG &&
+         j2Deg >= J2_MIN_DEG && j2Deg <= J2_MAX_DEG;
+}
+
+function forwardKinematics(j1Deg, j2Deg) {
+  const t1 = rad(j1Deg), t2 = rad(j2Deg);
+  const elbowX = -LINK_1_MM * Math.sin(t1);
+  const elbowY = LINK_1_MM * Math.cos(t1);
+  const tipX = elbowX + LINK_2_MM * Math.sin(t2 - t1);
+  const tipY = elbowY + LINK_2_MM * Math.cos(t2 - t1);
+  return { elbow: { x: elbowX, y: elbowY }, tip: { x: tipX, y: tipY } };
+}
+
+const TRAIL_BLADE_MM = 25;
+const TRAIL_MAX_TURN_RATE_DEG_PER_SEC = 360;
+const OVERCUT_RUNWAY_MM = TRAIL_BLADE_MM * 4;
+
+function normalizeAngleRad(angle) {
+  while (angle > Math.PI) angle -= Math.PI * 2;
+  while (angle < -Math.PI) angle += Math.PI * 2;
+  return angle;
+}
+
+function inverseKinematics(x, y, elbowDown) {
+  const c2raw = (x * x + y * y - LINK_1_MM * LINK_1_MM - LINK_2_MM * LINK_2_MM) /
+                (2 * LINK_1_MM * LINK_2_MM);
+  if (c2raw < -1.00001 || c2raw > 1.00001) return null;
+  const c2 = Math.min(1, Math.max(-1, c2raw));
+  let s2 = Math.sqrt(Math.max(0, 1 - c2 * c2));
+  if (elbowDown) s2 = -s2;
+  const t2 = Math.atan2(s2, c2);
+  const t1 = Math.atan2(x, y) - Math.atan2(LINK_2_MM * s2, LINK_1_MM + LINK_2_MM * c2);
+  const j1Deg = -deg(t1);
+  const j2Deg = deg(t2);
+  if (!angleInRange(j1Deg, j2Deg)) return null;
+  return { j1Deg, j2Deg };
+}
+
+function isPointReachable(x, y) {
+  return inverseKinematics(x, y, true) !== null || inverseKinematics(x, y, false) !== null;
+}
+
+function smoothPathXY(points, smoothingMs, maxDeviationDeg) {
+  if (points.length < 3 || smoothingMs <= 0) return points;
+
+  const smoothed = points.map(p => ({ x: p.x, y: p.y, t: p.t }));
+  const windowFractions = [1, 0.5, 0.25, 0];
+
+  for (let i = 0; i < points.length; i++) {
+    const rawX = points[i].x, rawY = points[i].y;
+    const reachMm = Math.max(Math.hypot(rawX, rawY), 20);
+    const maxDeviationMm = rad(maxDeviationDeg) * reachMm;
+    const elbowDown = rawX < 0;
+    let solved = false;
+
+    for (const fraction of windowFractions) {
+      const windowMs = smoothingMs * fraction;
+      let sx = rawX, sy = rawY;
+      if (windowMs > 0) {
+        let sumX = 0, sumY = 0, count = 0;
+        for (const q of points) {
+          if (Math.abs((q.t - points[i].t) * 1000) <= windowMs) {
+            sumX += q.x;
+            sumY += q.y;
+            count++;
+          }
+        }
+        sx = sumX / count;
+        sy = sumY / count;
+      }
+      if (maxDeviationDeg > 0) {
+        sx = Math.min(rawX + maxDeviationMm, Math.max(rawX - maxDeviationMm, sx));
+        sy = Math.min(rawY + maxDeviationMm, Math.max(rawY - maxDeviationMm, sy));
+      }
+      if (inverseKinematics(sx, sy, elbowDown)) {
+        smoothed[i].x = sx;
+        smoothed[i].y = sy;
+        solved = true;
+        break;
+      }
+    }
+    if (!solved) {
+      smoothed[i].x = rawX;
+      smoothed[i].y = rawY;
+    }
+  }
+
+  smoothed[0] = { ...points[0] };
+  smoothed[smoothed.length - 1] = { ...points[points.length - 1] };
+  return smoothed;
+}
+
+const canvas = document.getElementById('stage');
+const ctx = canvas.getContext('2d');
+const REACH_MM = LINK_1_MM + LINK_2_MM;
+const centerX = canvas.width / 2;
+const centerY = canvas.height / 2 + canvas.height * 0.18;
+const scale = (canvas.height * 0.42) / REACH_MM;
+
+const toScreen = (x, y) => ({ x: centerX + x * scale, y: centerY - y * scale });
+const toMm = (px, py) => ({ x: (px - centerX) / scale, y: (centerY - py) / scale });
+
+const REACH_BOUNDARY_SAMPLES = 180;
+
+function maxReachableRadius(dirX, dirY) {
+  let best = 0;
+  for (let r = 2; r <= REACH_MM; r += 2) {
+    if (isPointReachable(dirX * r, dirY * r)) best = r;
+  }
+  return best;
+}
+
+const reachBoundary = Array.from({ length: REACH_BOUNDARY_SAMPLES }, (_, i) => {
+  const phi = (i / REACH_BOUNDARY_SAMPLES) * Math.PI * 2;
+  const r = maxReachableRadius(Math.cos(phi), Math.sin(phi));
+  return { phi, r };
+});
+
+function boundaryRadiusAt(phi) {
+  let normalized = phi % (Math.PI * 2);
+  if (normalized < 0) normalized += Math.PI * 2;
+  const scaled = (normalized / (Math.PI * 2)) * REACH_BOUNDARY_SAMPLES;
+  const i0 = Math.floor(scaled) % REACH_BOUNDARY_SAMPLES;
+  const i1 = (i0 + 1) % REACH_BOUNDARY_SAMPLES;
+  const frac = scaled - Math.floor(scaled);
+  return reachBoundary[i0].r + (reachBoundary[i1].r - reachBoundary[i0].r) * frac;
+}
+
+function clampToReachable(x, y) {
+  const r = Math.hypot(x, y);
+  if (r === 0) return { x, y };
+  const boundaryR = boundaryRadiusAt(Math.atan2(y, x));
+  if (r <= boundaryR) return { x, y };
+  const scale = boundaryR / r;
+  return { x: x * scale, y: y * scale };
+}
+
+const HOME_DEADZONE_RADIUS_MM = 40;
+const homeArmSegment = (() => {
+  const fk = forwardKinematics(HOME_J1_DEG, HOME_J2_DEG);
+  return { ax: 0, ay: 0, bx: fk.elbow.x, by: fk.elbow.y };
+})();
+
+function nearestPointOnSegment(px, py, ax, ay, bx, by) {
+  const dx = bx - ax, dy = by - ay;
+  const lenSq = dx * dx + dy * dy;
+  let t = lenSq > 0 ? ((px - ax) * dx + (py - ay) * dy) / lenSq : 0;
+  t = Math.max(0, Math.min(1, t));
+  return { x: ax + dx * t, y: ay + dy * t };
+}
+
+function pushOutOfHomeDeadzone(x, y) {
+  const seg = homeArmSegment;
+  const nearest = nearestPointOnSegment(x, y, seg.ax, seg.ay, seg.bx, seg.by);
+  const dx = x - nearest.x, dy = y - nearest.y;
+  const dist = Math.hypot(dx, dy);
+  if (dist >= HOME_DEADZONE_RADIUS_MM) return { x, y };
+  if (dist < 1e-6) return { x: nearest.x + HOME_DEADZONE_RADIUS_MM, y: nearest.y };
+  const scale = HOME_DEADZONE_RADIUS_MM / dist;
+  return { x: nearest.x + dx * scale, y: nearest.y + dy * scale };
+}
+
+function clampToDrawable(x, y) {
+  const reachable = clampToReachable(x, y);
+  return pushOutOfHomeDeadzone(reachable.x, reachable.y);
+}
+
+let drawnPoints = [];
+let strokeStartMs = 0;
+let isDrawing = false;
+let isPlaying = false;
+let stabilizationEnabled = false;
+let arm = { j1: HOME_J1_DEG, j2: HOME_J2_DEG };
+let bladeDown = false;
+let trail = [];
+
+const PHYSICS_DT = 0.004;
+
+function stepCountFor(jointDistanceDeg, speedDegPerSec) {
+  return Math.max(1, Math.ceil(jointDistanceDeg / speedDegPerSec / PHYSICS_DT));
+}
+
+let trailBladeAngleRad = 0;
+let trailBladeLastPivot = null;
+
+function trailingBladeTip(pivot) {
+  return {
+    x: pivot.x + TRAIL_BLADE_MM * Math.cos(trailBladeAngleRad),
+    y: pivot.y + TRAIL_BLADE_MM * Math.sin(trailBladeAngleRad),
+  };
+}
+
+function advanceTrailAngle(currentAngleRad, dx, dy, dtSeconds) {
+  if (dtSeconds <= 0 || Math.hypot(dx, dy) <= 1e-4) return currentAngleRad;
+  const desiredAngle = Math.atan2(-dy, -dx);
+  const maxStep = rad(TRAIL_MAX_TURN_RATE_DEG_PER_SEC) * dtSeconds;
+  const delta = normalizeAngleRad(desiredAngle - currentAngleRad);
+  return normalizeAngleRad(currentAngleRad + Math.max(-maxStep, Math.min(maxStep, delta)));
+}
+
+function updateTrailingBlade(pivot) {
+  if (trailBladeLastPivot === null) {
+    trailBladeLastPivot = pivot;
+    return;
+  }
+  const dx = pivot.x - trailBladeLastPivot.x;
+  const dy = pivot.y - trailBladeLastPivot.y;
+  trailBladeLastPivot = pivot;
+  trailBladeAngleRad = advanceTrailAngle(trailBladeAngleRad, dx, dy, PHYSICS_DT);
+}
+
+function resetTrailingBlade() {
+  const fk = forwardKinematics(arm.j1, arm.j2);
+  trailBladeAngleRad = Math.atan2(fk.tip.y - fk.elbow.y, fk.tip.x - fk.elbow.x);
+  trailBladeLastPivot = null;
+}
+resetTrailingBlade();
+
+const playBtn = document.getElementById('playBtn');
+const clearBtn = document.getElementById('clearBtn');
+const stabilizeCheckbox = document.getElementById('stabilizeCheckbox');
+const bladeVal = document.getElementById('bladeVal');
+const j1ValEl = document.getElementById('j1Val');
+const j2ValEl = document.getElementById('j2Val');
+
+stabilizeCheckbox.addEventListener('change', () => {
+  stabilizationEnabled = stabilizeCheckbox.checked;
+});
+
+function pointerPos(evt) {
+  const rect = canvas.getBoundingClientRect();
+  const clientX = evt.touches ? evt.touches[0].clientX : evt.clientX;
+  const clientY = evt.touches ? evt.touches[0].clientY : evt.clientY;
+  return { px: clientX - rect.left, py: clientY - rect.top };
+}
+
+function startDrawing(evt) {
+  if (isPlaying) return;
+  isDrawing = true;
+  drawnPoints = [];
+  strokeStartMs = performance.now();
+  addPoint(evt);
+}
+
+function addPoint(evt) {
+  if (!isDrawing) return;
+  const { px, py } = pointerPos(evt);
+  const raw = toMm(px, py);
+  const mm = clampToDrawable(raw.x, raw.y);
+  const last = drawnPoints[drawnPoints.length - 1];
+  if (!last || Math.hypot(mm.x - last.x, mm.y - last.y) > 3) {
+    const t = (performance.now() - strokeStartMs) / 1000;
+    drawnPoints.push({ x: mm.x, y: mm.y, t });
+    render();
+  }
+  evt.preventDefault();
+}
+
+function stopDrawing() {
+  isDrawing = false;
+}
+
+canvas.addEventListener('mousedown', startDrawing);
+canvas.addEventListener('mousemove', addPoint);
+window.addEventListener('mouseup', stopDrawing);
+canvas.addEventListener('touchstart', startDrawing, { passive: false });
+canvas.addEventListener('touchmove', addPoint, { passive: false });
+canvas.addEventListener('touchend', stopDrawing);
+
+clearBtn.addEventListener('click', () => {
+  if (isPlaying) return;
+  drawnPoints = [];
+  trail = [];
+  arm = { j1: HOME_J1_DEG, j2: HOME_J2_DEG };
+  bladeDown = false;
+  resetTrailingBlade();
+  render();
+});
+
+function render() {
+  ctx.clearRect(0, 0, canvas.width, canvas.height);
+
+  ctx.beginPath();
+  reachBoundary.forEach((pt, i) => {
+    const screen = toScreen(pt.r * Math.cos(pt.phi), pt.r * Math.sin(pt.phi));
+    i === 0 ? ctx.moveTo(screen.x, screen.y) : ctx.lineTo(screen.x, screen.y);
+  });
+  ctx.closePath();
+  ctx.fillStyle = '#B0B0B0';
+  ctx.fill();
+
+  ctx.save();
+  ctx.globalCompositeOperation = 'destination-out';
+  const deadzoneA = toScreen(homeArmSegment.ax, homeArmSegment.ay);
+  const deadzoneB = toScreen(homeArmSegment.bx, homeArmSegment.by);
+  ctx.lineWidth = HOME_DEADZONE_RADIUS_MM * 2 * scale;
+  ctx.lineCap = 'round';
+  ctx.strokeStyle = '#000000';
+  ctx.beginPath();
+  ctx.moveTo(deadzoneA.x, deadzoneA.y);
+  ctx.lineTo(deadzoneB.x, deadzoneB.y);
+  ctx.stroke();
+  ctx.restore();
+
+  if (drawnPoints.length > 1) {
+    ctx.lineWidth = 2;
+    ctx.strokeStyle = '#111111';
+    ctx.beginPath();
+    drawnPoints.forEach((p, i) => {
+      const s = toScreen(p.x, p.y);
+      i === 0 ? ctx.moveTo(s.x, s.y) : ctx.lineTo(s.x, s.y);
+    });
+    ctx.stroke();
+  }
+
+  ctx.lineWidth = 3;
+  ctx.strokeStyle = '#e0332f';
+  trail.forEach(seg => {
+    const a = toScreen(seg.x1, seg.y1);
+    const b = toScreen(seg.x2, seg.y2);
+    ctx.beginPath();
+    ctx.moveTo(a.x, a.y);
+    ctx.lineTo(b.x, b.y);
+    ctx.stroke();
+  });
+
+  const { elbow, tip: pivot } = forwardKinematics(arm.j1, arm.j2);
+  const bladeTip = trailingBladeTip(pivot);
+  const base = toScreen(0, 0);
+  const elbowS = toScreen(elbow.x, elbow.y);
+  const pivotS = toScreen(pivot.x, pivot.y);
+  const bladeTipS = toScreen(bladeTip.x, bladeTip.y);
+
+  ctx.lineWidth = 60;
+  ctx.lineCap = 'round';
+  ctx.strokeStyle = '#4C47E240';
+  ctx.beginPath();
+  ctx.moveTo(base.x, base.y);
+  ctx.lineTo(elbowS.x, elbowS.y);
+  ctx.stroke();
+
+  ctx.strokeStyle = '#4C47E240';
+  ctx.beginPath();
+  ctx.moveTo(elbowS.x, elbowS.y);
+  ctx.lineTo(pivotS.x, pivotS.y);
+  ctx.stroke();
+
+  ctx.lineWidth = 15;
+  ctx.setLineDash([3, 3]);
+  ctx.strokeStyle = '#111111';
+  ctx.beginPath();
+  ctx.moveTo(pivotS.x, pivotS.y);
+  ctx.lineTo(bladeTipS.x, bladeTipS.y);
+  ctx.stroke();
+  ctx.setLineDash([]);
+
+  [base, elbowS, pivotS].forEach(p => {
+    ctx.beginPath();
+    ctx.arc(p.x, p.y, 7, 0, Math.PI * 2);
+    ctx.fillStyle = '#1a1d22';
+    ctx.fill();
+  });
+
+  ctx.beginPath();
+  ctx.arc(bladeTipS.x, bladeTipS.y, 8, 0, Math.PI * 2);
+  ctx.fillStyle = bladeDown ? '#e0332f' : '#6b7280';
+  ctx.fill();
+
+  updateStats();
+}
+
+function updateStats() {
+  j1ValEl.textContent = `${arm.j1.toFixed(1)}°`;
+  j2ValEl.textContent = `${arm.j2.toFixed(1)}°`;
+  bladeVal.textContent = bladeDown ? 'DOWN' : 'UP';
+}
+
+render();
+
+function groupIntoElbowRuns(points) {
+  const runs = [];
+  let current = [];
+  let currentElbow = null;
+  let skippedPoints = 0;
+
+  for (const p of points) {
+    if (currentElbow !== null && inverseKinematics(p.x, p.y, currentElbow)) {
+      current.push(p);
+      continue;
+    }
+
+    if (current.length > 0) runs.push({ elbow: currentElbow, points: current });
+    current = [];
+    currentElbow = null;
+
+    const preferredElbow = p.x < 0;
+    let elbow = preferredElbow;
+    if (!inverseKinematics(p.x, p.y, elbow)) {
+      elbow = !preferredElbow;
+      if (!inverseKinematics(p.x, p.y, elbow)) {
+        skippedPoints++;
+        continue;
+      }
+    }
+    currentElbow = elbow;
+    current.push(p);
+  }
+  if (current.length > 0) runs.push({ elbow: currentElbow, points: current });
+
+  return { runs, skippedPoints };
+}
+
+function overcutApproachPoint(points, elbow) {
+  if (points.length < 2) return null;
+  const dx = points[1].x - points[0].x, dy = points[1].y - points[0].y;
+  const len = Math.hypot(dx, dy);
+  if (len < 1e-6) return null;
+  const ux = dx / len, uy = dy / len;
+  const fractions = [1, 0.5, 0.25, 0.125, 0.0625, 0.03, 0.015];
+  for (const fraction of fractions) {
+    const distanceMm = OVERCUT_RUNWAY_MM * fraction;
+    const candX = points[0].x - ux * distanceMm;
+    const candY = points[0].y - uy * distanceMm;
+    if (inverseKinematics(candX, candY, elbow)) return { x: candX, y: candY };
+  }
+  return null;
+}
+
+function solveElbowRuns(topology) {
+  let reference = HOME_J2_DEG;
+  const solveOne = (p, elbow) => {
+    const solved = inverseKinematics(p.x, p.y, elbow);
+    const j2Unwrapped = reference + shortestJointDelta(solved.j2Deg, reference);
+    reference = j2Unwrapped;
+    return { j1: solved.j1Deg, j2: j2Unwrapped };
+  };
+  return topology.map(({ elbow, points }) => {
+    const approachPoint = overcutApproachPoint(points, elbow);
+    const approach = approachPoint ? solveOne(approachPoint, elbow) : null;
+    return { approach, points: points.map(p => solveOne(p, elbow)) };
+  });
+}
+
+function simulateBladeArrivals(runs, speedDegPerSec) {
+  let simJ1 = HOME_J1_DEG, simJ2 = HOME_J2_DEG;
+  const homeFk = forwardKinematics(simJ1, simJ2);
+  let simAngle = Math.atan2(homeFk.tip.y - homeFk.elbow.y, homeFk.tip.x - homeFk.elbow.x);
+  let simLastPivot = homeFk.tip;
+
+  function driveTo(target) {
+    const startJ1 = simJ1, startJ2 = simJ2;
+    const distance = Math.max(Math.abs(target.j1 - startJ1), Math.abs(target.j2 - startJ2));
+    const steps = stepCountFor(distance, speedDegPerSec);
+    for (let s = 1; s <= steps; s++) {
+      const frac = s / steps;
+      simJ1 = startJ1 + (target.j1 - startJ1) * frac;
+      simJ2 = startJ2 + (target.j2 - startJ2) * frac;
+      const pivot = forwardKinematics(simJ1, simJ2).tip;
+      simAngle = advanceTrailAngle(
+          simAngle, pivot.x - simLastPivot.x, pivot.y - simLastPivot.y, PHYSICS_DT);
+      simLastPivot = pivot;
+    }
+    return {
+      x: simLastPivot.x + TRAIL_BLADE_MM * Math.cos(simAngle),
+      y: simLastPivot.y + TRAIL_BLADE_MM * Math.sin(simAngle),
+    };
+  }
+
+  return runs.map(run => {
+    if (run.approach) driveTo(run.approach);
+    return run.points.map(target => driveTo(target));
+  });
+}
+
+function computeBladeCompensatedPath(desiredPoints, speedDegPerSec) {
+  const { runs: topology, skippedPoints } = groupIntoElbowRuns(desiredPoints);
+  if (topology.length === 0) return { runs: [], skippedPoints };
+
+  const state = topology.map(({ elbow, points }) => ({
+    elbow,
+    points: points.map((p, i) => {
+      const prev = points[Math.max(0, i - 1)];
+      const next = points[Math.min(points.length - 1, i + 1)];
+      const dx = next.x - prev.x, dy = next.y - prev.y;
+      const len = Math.hypot(dx, dy);
+      let x = p.x, y = p.y;
+      if (len >= 1e-6) {
+        const candX = p.x + TRAIL_BLADE_MM * dx / len;
+        const candY = p.y + TRAIL_BLADE_MM * dy / len;
+        if (inverseKinematics(candX, candY, elbow)) { x = candX; y = candY; }
+      }
+      return { x, y, desiredX: p.x, desiredY: p.y };
+    }),
+  }));
+
+  const iterations = 6;
+  const gain = 0.85;
+  const asTopology = () => state.map(run => ({ elbow: run.elbow, points: run.points }));
+
+  let jointRuns = solveElbowRuns(asTopology());
+  for (let iter = 0; iter < iterations; iter++) {
+    const arrivals = simulateBladeArrivals(jointRuns, speedDegPerSec);
+    for (let r = 0; r < state.length; r++) {
+      for (let i = 0; i < state[r].points.length; i++) {
+        const pt = state[r].points[i];
+        const actual = arrivals[r][i];
+        const nextX = pt.x + gain * (pt.desiredX - actual.x);
+        const nextY = pt.y + gain * (pt.desiredY - actual.y);
+        if (inverseKinematics(nextX, nextY, state[r].elbow)) {
+          pt.x = nextX;
+          pt.y = nextY;
+        }
+      }
+    }
+    jointRuns = solveElbowRuns(asTopology());
+  }
+
+  return { runs: jointRuns, skippedPoints };
+}
+
+function animateTo(target, speedDegPerSec, traceTrail) {
+  return new Promise(resolve => {
+    const start = { j1: arm.j1, j2: arm.j2 };
+    const distance = Math.max(Math.abs(target.j1 - start.j1), Math.abs(target.j2 - start.j2));
+    const totalSteps = stepCountFor(distance, speedDegPerSec);
+    let stepsDone = 0;
+    let lastBladeTip = trailingBladeTip(forwardKinematics(arm.j1, arm.j2).tip);
+    let accumulatorS = 0;
+    let lastNow = null;
+
+    function substep() {
+      stepsDone++;
+      const frac = stepsDone / totalSteps;
+      arm.j1 = start.j1 + (target.j1 - start.j1) * frac;
+      arm.j2 = start.j2 + (target.j2 - start.j2) * frac;
+      const pivot = forwardKinematics(arm.j1, arm.j2).tip;
+      updateTrailingBlade(pivot);
+      const bladeTip = trailingBladeTip(pivot);
+      if (traceTrail) {
+        trail.push({ x1: lastBladeTip.x, y1: lastBladeTip.y, x2: bladeTip.x, y2: bladeTip.y });
+      }
+      lastBladeTip = bladeTip;
+    }
+
+    function frame(now) {
+      if (lastNow === null) lastNow = now;
+      accumulatorS = Math.min(accumulatorS + (now - lastNow) / 1000, 0.25);
+      lastNow = now;
+
+      while (accumulatorS >= PHYSICS_DT && stepsDone < totalSteps) {
+        substep();
+        accumulatorS -= PHYSICS_DT;
+      }
+      render();
+
+      if (stepsDone < totalSteps) requestAnimationFrame(frame);
+      else resolve();
+    }
+    requestAnimationFrame(frame);
+  });
+}
+
+async function play() {
+
+  const sourcePoints = stabilizationEnabled
+      ? smoothPathXY(drawnPoints, PRODUCT_SMOOTHING_MS, PRODUCT_MAX_DEVIATION_DEG)
+      : drawnPoints;
+  const speed = PLAYBACK_SPEED_DEG_PER_SEC;
+
+  playBtn.disabled = true;
+  clearBtn.disabled = true;
+  stabilizeCheckbox.disabled = true;
+  await new Promise(resolve => setTimeout(resolve, 0));
+
+  const { runs } = computeBladeCompensatedPath(sourcePoints, speed);
+  if (runs.length === 0) {
+    playBtn.disabled = false;
+    clearBtn.disabled = false;
+    stabilizeCheckbox.disabled = false;
+    return;
+  }
+
+  isPlaying = true;
+  trail = [];
+
+  arm = { j1: HOME_J1_DEG, j2: HOME_J2_DEG };
+  bladeDown = false;
+  resetTrailingBlade();
+  render();
+
+  for (const run of runs) {
+    if (run.approach) await animateTo(run.approach, speed, false);
+    await animateTo(run.points[0], speed, false);
+    bladeDown = true;
+    render();
+    for (let i = 1; i < run.points.length; i++) {
+      await animateTo(run.points[i], speed, true);
+    }
+    bladeDown = false;
+    render();
+  }
+
+  isPlaying = false;
+  playBtn.disabled = false;
+  clearBtn.disabled = false;
+  stabilizeCheckbox.disabled = false;
+}
+
+playBtn.addEventListener('click', play);
+</script>
+</body>
+</html>
